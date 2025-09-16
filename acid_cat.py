@@ -42,11 +42,19 @@ def midi_note_to_name(note_number):
     return f"{note}{octave}"
 
 def safe_basename_for_csv(path_basename):
-    # sluggy but readable: spaces -> _, strip weird chars
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", path_basename.strip())
-    if not name.lower().endswith(".csv"):
-        name += ".csv"
-    return name
+    """
+    Preserve directory portion; slugify only the basename.
+    Ensures parent directories exist and .csv suffix is present.
+    """
+    path_norm = os.path.normpath(path_basename)
+    dirpart, base = os.path.split(path_norm)
+    base_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", base.strip()) or "output.csv"
+    if not base_slug.lower().endswith(".csv"):
+        base_slug += ".csv"
+    if dirpart:
+        os.makedirs(dirpart, exist_ok=True)
+        return os.path.join(dirpart, base_slug)
+    return base_slug
 
 # --------------------------
 # Core RIFF parser
@@ -245,12 +253,79 @@ def parse_riff(filepath, enumerate_all=False):
 
     return results, meta, seen_order
 
+# --------------------------
+# Duration helpers
+# --------------------------
+def _duration_from_headers(filepath):
+    """
+    Header-only duration calc:
+      - If 'fact' has sample_length and we know sample_rate: samples / sr
+      - Else if PCM-like: data_bytes / (sr * channels * (bits/8))
+    Returns float seconds or None.
+    """
+    try:
+        size = os.path.getsize(filepath)
+        with open(filepath, "rb") as f:
+            hdr = f.read(12)
+            if len(hdr) < 12 or hdr[0:4] != b'RIFF' or hdr[8:12] != b'WAVE':
+                return None
+
+            sample_rate = None
+            channels = None
+            bits_per_sample = None
+            data_bytes = None
+            fact_samples = None
+
+            pos = 12
+            while pos + 8 <= size:
+                f.seek(pos)
+                ch = f.read(8)
+                if len(ch) < 8:
+                    break
+                cid = ch[0:4]
+                csz = struct.unpack("<I", ch[4:8])[0]
+                payload_off = pos + 8
+
+                if cid == b'fmt ' and csz >= 16:
+                    f.seek(payload_off)
+                    fmt = f.read(16)
+                    wFormatTag, nChannels, nSamplesPerSec, nAvgBytesPerSec, nBlockAlign, wBitsPerSample = struct.unpack("<HHIIHH", fmt)
+                    sample_rate = nSamplesPerSec
+                    channels = nChannels
+                    bits_per_sample = wBitsPerSample
+                elif cid == b'fact' and csz >= 4:
+                    f.seek(payload_off)
+                    fact = f.read(4)
+                    fact_samples = struct.unpack("<I", fact)[0]
+                elif cid == b'data':
+                    data_bytes = csz
+
+                pos += 8 + csz
+                if csz % 2 == 1:
+                    pos += 1
+
+            # Prefer fact (sample-length) if available
+            if fact_samples and sample_rate:
+                return round(fact_samples / float(sample_rate), 4)
+
+            # Otherwise compute from raw PCM-ish parameters
+            if sample_rate and channels and bits_per_sample and data_bytes is not None and bits_per_sample > 0:
+                bytes_per_frame = channels * max(bits_per_sample // 8, 1)
+                if bytes_per_frame > 0:
+                    frames = data_bytes / float(bytes_per_frame)
+                    return round(frames / float(sample_rate), 4)
+    except Exception:
+        return None
+    return None
+
 def get_duration(filepath):
     try:
         with wave.open(filepath, 'rb') as wf:
             return round(wf.getnframes() / float(wf.getframerate()), 4)
-    except:
-        return None
+    except Exception:
+        pass
+    # Fallback for non-PCM / unsupported codecs (ADPCM, etc.)
+    return _duration_from_headers(filepath)
 
 # --------------------------
 # Main
@@ -268,7 +343,7 @@ def main():
     parser.add_argument("--has", help="Only include files that contain any of these chunk IDs (comma-separated, e.g. 'acid,smpl,LIST').")
     args = parser.parse_args()
 
-    # Normalize output name, slugified a bit for Windows comfort
+    # Normalize output name, preserving directories
     default_base = os.path.basename(os.path.normpath(args.directory))
     output_csv = safe_basename_for_csv(args.output or (default_base + "_metadata.csv"))
 
