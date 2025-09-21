@@ -29,6 +29,75 @@ import struct
 import wave
 import binascii
 from collections import Counter
+import librosa
+import numpy as np
+
+def estimate_librosa_metadata(filepath):
+    try:
+        y, sr = librosa.load(filepath, sr=None, mono=True)
+        duration_sec = round(len(y) / sr, 4) if sr and len(y) > 0 else None
+
+        # Skip absurdly short clips → call it a one-shot
+        if len(y) < 256:
+            return {
+                "estimated_bpm": "oneshot",
+                "estimated_key": None,
+                "duration_sec": duration_sec
+            }
+
+        # --- BPM estimation ---
+        bpm = None
+        try:
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            tempos = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, aggregate=None)
+            if tempos.size > 0:
+                bpm = round(float(np.median(tempos)), 2)
+        except Exception:
+            pass
+
+        # Fallback: parse BPM from filename if librosa failed
+        if bpm is None:
+            import re, os
+            match = re.search(r'_(\d{2,3})(?:_|$)', os.path.basename(filepath))
+            if match:
+                bpm = int(match.group(1))
+
+        # --- Key estimation ---
+        key = None
+        try:
+            # Pick n_fft safe for the clip
+            default_n_fft = 1024
+            n_fft = min(default_n_fft, max(16, len(y)))
+
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, n_fft=n_fft)
+            if chroma.size > 0:
+                chroma_mean = chroma.mean(axis=1)
+                if np.any(chroma_mean > 0):
+                    note_number = int(np.argmax(chroma_mean))
+                    note_names = ["C", "C#", "D", "D#", "E", "F",
+                                  "F#", "G", "G#", "A", "A#", "B"]
+                    key = note_names[note_number]
+        except Exception:
+            pass
+
+
+
+        return {
+            "estimated_bpm": bpm,
+            "estimated_key": key,
+            "duration_sec": duration_sec
+        }
+
+    except Exception:
+        # Total failure fallback
+        return {
+            "estimated_bpm": None,
+            "estimated_key": None,
+            "duration_sec": None
+        }
+
+
+
 
 # --------------------------
 # Helper: MIDI note -> name
@@ -42,11 +111,19 @@ def midi_note_to_name(note_number):
     return f"{note}{octave}"
 
 def safe_basename_for_csv(path_basename):
-    # sluggy but readable: spaces -> _, strip weird chars
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", path_basename.strip())
-    if not name.lower().endswith(".csv"):
-        name += ".csv"
-    return name
+    """
+    Preserve directory portion; slugify only the basename.
+    Ensures parent directories exist and .csv suffix is present.
+    """
+    path_norm = os.path.normpath(path_basename)
+    dirpart, base = os.path.split(path_norm)
+    base_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", base.strip()) or "output.csv"
+    if not base_slug.lower().endswith(".csv"):
+        base_slug += ".csv"
+    if dirpart:
+        os.makedirs(dirpart, exist_ok=True)
+        return os.path.join(dirpart, base_slug)
+    return base_slug
 
 # --------------------------
 # Core RIFF parser
@@ -245,12 +322,79 @@ def parse_riff(filepath, enumerate_all=False):
 
     return results, meta, seen_order
 
+# --------------------------
+# Duration helpers
+# --------------------------
+def _duration_from_headers(filepath):
+    """
+    Header-only duration calc:
+      - If 'fact' has sample_length and we know sample_rate: samples / sr
+      - Else if PCM-like: data_bytes / (sr * channels * (bits/8))
+    Returns float seconds or None.
+    """
+    try:
+        size = os.path.getsize(filepath)
+        with open(filepath, "rb") as f:
+            hdr = f.read(12)
+            if len(hdr) < 12 or hdr[0:4] != b'RIFF' or hdr[8:12] != b'WAVE':
+                return None
+
+            sample_rate = None
+            channels = None
+            bits_per_sample = None
+            data_bytes = None
+            fact_samples = None
+
+            pos = 12
+            while pos + 8 <= size:
+                f.seek(pos)
+                ch = f.read(8)
+                if len(ch) < 8:
+                    break
+                cid = ch[0:4]
+                csz = struct.unpack("<I", ch[4:8])[0]
+                payload_off = pos + 8
+
+                if cid == b'fmt ' and csz >= 16:
+                    f.seek(payload_off)
+                    fmt = f.read(16)
+                    wFormatTag, nChannels, nSamplesPerSec, nAvgBytesPerSec, nBlockAlign, wBitsPerSample = struct.unpack("<HHIIHH", fmt)
+                    sample_rate = nSamplesPerSec
+                    channels = nChannels
+                    bits_per_sample = wBitsPerSample
+                elif cid == b'fact' and csz >= 4:
+                    f.seek(payload_off)
+                    fact = f.read(4)
+                    fact_samples = struct.unpack("<I", fact)[0]
+                elif cid == b'data':
+                    data_bytes = csz
+
+                pos += 8 + csz
+                if csz % 2 == 1:
+                    pos += 1
+
+            # Prefer fact (sample-length) if available
+            if fact_samples and sample_rate:
+                return round(fact_samples / float(sample_rate), 4)
+
+            # Otherwise compute from raw PCM-ish parameters
+            if sample_rate and channels and bits_per_sample and data_bytes is not None and bits_per_sample > 0:
+                bytes_per_frame = channels * max(bits_per_sample // 8, 1)
+                if bytes_per_frame > 0:
+                    frames = data_bytes / float(bytes_per_frame)
+                    return round(frames / float(sample_rate), 4)
+    except Exception:
+        return None
+    return None
+
 def get_duration(filepath):
     try:
         with wave.open(filepath, 'rb') as wf:
             return round(wf.getnframes() / float(wf.getframerate()), 4)
-    except:
-        return None
+    except Exception:
+        pass
+    # Fallback for non-PCM / unsupported codecs (ADPCM, etc.)
+    return _duration_from_headers(filepath)
 
 # --------------------------
 # Main
@@ -266,9 +410,10 @@ def main():
     parser.add_argument("--survey", action="store_true", help="Count chunk IDs across scanned files.")
     parser.add_argument("--kinds", "-k", action="store_true", help="Print just chunk kinds per file and write <name>_kinds.csv.")
     parser.add_argument("--has", help="Only include files that contain any of these chunk IDs (comma-separated, e.g. 'acid,smpl,LIST').")
+    parser.add_argument("--fallback", action="store_true", help="Estimate BPM/key with librosa if no metadata found")
     args = parser.parse_args()
 
-    # Normalize output name, slugified a bit for Windows comfort
+    # Normalize output name, preserving directories
     default_base = os.path.basename(os.path.normpath(args.directory))
     output_csv = safe_basename_for_csv(args.output or (default_base + "_metadata.csv"))
 
@@ -380,7 +525,7 @@ def main():
                         expected = round((meta["acid_beats"] / meta["bpm"]) * 60, 4)
                         diff = round(duration - expected, 4) if duration else None
 
-                    rows.append({
+                    row = {
                         "filename": filepath,
                         "bpm": meta["bpm"],
                         "acid_root_note": midi_note_to_name(meta["acid_root_note"]),
@@ -392,33 +537,62 @@ def main():
                         "expected_duration": expected,
                         "duration_diff": diff,
                         "other_chunks": ",".join([c for c in seen if c not in ("RIFF","WAVE","fmt ","data","acid","smpl")])
-                    })
+                    }
+
+                    # --- Fallback to librosa estimates if no ACID/SMPL metadata ---
+                    has_acid_metadata = meta["bpm"] is not None or meta["smpl_root_key"] is not None
+                    if not has_acid_metadata and args.fallback:
+                        estimates = estimate_librosa_metadata(filepath)
+                        dur_sec = estimates.get("duration_sec")
+                        bpm_val = estimates.get("estimated_bpm")
+                        key_val = estimates.get("estimated_key")
+
+                        # Update row with fallback values
+                        row["bpm"] = row.get("bpm") or bpm_val
+                        row["smpl_root_key"] = row.get("smpl_root_key") or key_val
+                        row["duration_sec"] = row.get("duration_sec") or dur_sec
+
+                        if not args.quiet:
+                            if bpm_val == "oneshot":
+                                dur_str = f"{round(dur_sec, 3)} sec" if dur_sec else "(unknown)"
+                                print(f"   [Fallback] One-shot detected! Duration: {dur_str} | Key: {key_val or 'N/A'}")
+                            else:
+                                dur_str = f"{round(dur_sec, 3)} sec" if dur_sec else "(unknown)"
+                                print(f"   [Fallback] Estimated BPM: {bpm_val}, Estimated Key: {key_val or 'N/A'}, Duration: {dur_str}")
+
+                    rows.append(row)
 
                     if not args.quiet:
                         print(f"\n=== {os.path.basename(filepath)} ===")
-                        if meta["bpm"] is not None:
-                            print(f"   BPM: {meta['bpm']} | Beats: {meta['acid_beats']} | Duration: {duration} sec")
+
+                        # Prefer values from the row (after fallback merge)
+                        bpm_val = row.get("bpm")
+                        key_val = row.get("smpl_root_key")
+                        dur_val = row.get("duration_sec")
+
+                        if bpm_val is not None and bpm_val != "oneshot":
+                            print(f"   BPM: {bpm_val} | Beats: {meta['acid_beats']} | Duration: {dur_val} sec")
                             if expected is not None:
                                 print(f"   Expected: {expected} sec | Diff: {diff}")
+                        elif bpm_val == "oneshot":
+                            print(f"   One-shot sample | Duration: {dur_val} sec | Key: {key_val or 'N/A'}")
                         else:
-                            print(f"   No ACID/SMPL metadata found. Duration: {duration} sec")
+                            print(f"   No ACID/SMPL metadata found. Duration: {dur_val} sec")
 
-                        if meta["smpl_root_key"]:
-                            print(f"   Root Key (SMPL): {midi_note_to_name(meta['smpl_root_key'])}")
+                        if key_val:
+                            print(f"   Root Key: {key_val}")
                         if meta["smpl_loop_start"] is not None:
                             print(f"   Loop Points: {meta['smpl_loop_start']} -> {meta['smpl_loop_end']} samples")
 
-                        others = [c for c in seen if c not in ("RIFF","WAVE","fmt ","data","acid","smpl")]
+                        others = [c for c in seen if c not in ("RIFF", "WAVE", "fmt ", "data", "acid", "smpl")]
                         if others:
                             print("   Other chunks:", ", ".join(others))
 
-                count += 1
-                if count >= args.num:
-                    break
-        if count >= args.num:
-            break
+                    count += 1
+                    if count >= args.num:
+                        break
 
-    with open(output_csv, "w", newline="") as csvfile:
+    with open(output_csv, "w", newline="", encoding="utf-8") as csvfile:
         if args.all:
             fieldnames = ["filename", "chunk", "key", "value"]
         else:
