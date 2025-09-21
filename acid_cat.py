@@ -33,6 +33,89 @@ import binascii
 from collections import Counter
 import librosa
 import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings("ignore")
+
+def extract_advanced_audio_features(filepath):
+    """
+    Extract comprehensive audio features for ML analysis.
+    Returns dictionary with spectral, rhythmic, and timbral features.
+    """
+    try:
+        y, sr = librosa.load(filepath, sr=None, mono=True)
+
+        if len(y) < 256:
+            return None  # Skip very short clips
+
+        features = {}
+
+        # Basic properties
+        features['duration_sec'] = len(y) / sr
+        features['sample_rate'] = sr
+        features['audio_length_samples'] = len(y)
+
+        # Spectral features
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        features['spectral_centroid_mean'] = np.mean(spectral_centroids)
+        features['spectral_centroid_std'] = np.std(spectral_centroids)
+
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+        features['spectral_rolloff_mean'] = np.mean(spectral_rolloff)
+        features['spectral_rolloff_std'] = np.std(spectral_rolloff)
+
+        spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+        features['spectral_bandwidth_mean'] = np.mean(spectral_bandwidth)
+        features['spectral_bandwidth_std'] = np.std(spectral_bandwidth)
+
+        # Zero crossing rate
+        zcr = librosa.feature.zero_crossing_rate(y)[0]
+        features['zcr_mean'] = np.mean(zcr)
+        features['zcr_std'] = np.std(zcr)
+
+        # MFCC features (first 13 coefficients)
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+        for i in range(13):
+            features[f'mfcc_{i+1}_mean'] = np.mean(mfccs[i])
+            features[f'mfcc_{i+1}_std'] = np.std(mfccs[i])
+
+        # Chroma features
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        features['chroma_mean'] = np.mean(chroma)
+        features['chroma_std'] = np.std(chroma)
+
+        # Mel-frequency features
+        mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr)
+        features['mel_mean'] = np.mean(mel_spectrogram)
+        features['mel_std'] = np.std(mel_spectrogram)
+
+        # Tempo and rhythm
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+        features['tempo_librosa'] = tempo
+        features['beat_count'] = len(beats)
+
+        # RMS energy
+        rms = librosa.feature.rms(y=y)[0]
+        features['rms_mean'] = np.mean(rms)
+        features['rms_std'] = np.std(rms)
+
+        # Spectral contrast
+        contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+        features['spectral_contrast_mean'] = np.mean(contrast)
+        features['spectral_contrast_std'] = np.std(contrast)
+
+        # Tonnetz (tonal centroid features)
+        tonnetz = librosa.feature.tonnetz(y=y, sr=sr)
+        features['tonnetz_mean'] = np.mean(tonnetz)
+        features['tonnetz_std'] = np.std(tonnetz)
+
+        return features
+
+    except Exception as e:
+        print(f"Error extracting features from {filepath}: {e}")
+        return None
 
 def estimate_librosa_metadata(filepath):
     try:
@@ -413,6 +496,8 @@ def main():
     parser.add_argument("--kinds", "-k", action="store_true", help="Print just chunk kinds per file and write <name>_kinds.csv.")
     parser.add_argument("--has", help="Only include files that contain any of these chunk IDs (comma-separated, e.g. 'acid,smpl,LIST').")
     parser.add_argument("--fallback", action="store_true", help="Estimate BPM/key with librosa if no metadata found")
+    parser.add_argument("--features", action="store_true", help="Extract advanced audio features (MFCC, spectral, etc.) for ML analysis")
+    parser.add_argument("--ml-ready", action="store_true", help="Output ML-ready CSV with normalized features and embeddings")
     args = parser.parse_args()
 
     # Normalize output name, preserving directories
@@ -541,6 +626,18 @@ def main():
                         "other_chunks": ",".join([c for c in seen if c not in ("RIFF","WAVE","fmt ","data","acid","smpl")])
                     }
 
+                    # --- Extract advanced audio features if requested ---
+                    if args.features or args.ml_ready:
+                        if not args.quiet:
+                            print(f"   [Feature Extraction] Processing {os.path.basename(filepath)}...")
+
+                        features = extract_advanced_audio_features(filepath)
+                        if features:
+                            row.update(features)
+                        else:
+                            if not args.quiet:
+                                print(f"   [Warning] Could not extract features from {os.path.basename(filepath)}")
+
                     # --- Fallback to librosa estimates if no ACID/SMPL metadata ---
                     has_acid_metadata = meta["bpm"] is not None or meta["smpl_root_key"] is not None
                     if not has_acid_metadata and args.fallback:
@@ -594,18 +691,60 @@ def main():
                     if count >= args.num:
                         break
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as csvfile:
-        if args.all:
-            fieldnames = ["filename", "chunk", "key", "value"]
-        else:
-            fieldnames = ["filename", "bpm", "acid_root_note", "acid_beats", "smpl_root_key",
+    # Determine fieldnames dynamically based on data
+    if args.all:
+        fieldnames = ["filename", "chunk", "key", "value"]
+    else:
+        # Base fieldnames
+        base_fieldnames = ["filename", "bpm", "acid_root_note", "acid_beats", "smpl_root_key",
                           "smpl_loop_start", "smpl_loop_end", "duration_sec",
                           "expected_duration", "duration_diff", "other_chunks"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
 
-    print(f"\n[INFO] Wrote metadata for {len(rows)} entries to {output_csv}")
+        # If features were extracted, get all possible fieldnames from the data
+        if (args.features or args.ml_ready) and rows:
+            all_keys = set()
+            for row in rows:
+                all_keys.update(row.keys())
+            # Keep base fields first, then add feature fields in sorted order
+            feature_keys = sorted([k for k in all_keys if k not in base_fieldnames])
+            fieldnames = base_fieldnames + feature_keys
+        else:
+            fieldnames = base_fieldnames
+
+    # Write to CSV
+    if args.ml_ready and not args.all:
+        # For ML-ready output, also create a normalized version
+        df = pd.DataFrame(rows)
+
+        # Save raw features CSV
+        df.to_csv(output_csv, index=False)
+
+        # Create normalized version for ML
+        ml_csv = output_csv.replace('.csv', '_ml_ready.csv')
+
+        # Select only numeric columns for normalization
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        non_numeric_cols = [col for col in df.columns if col not in numeric_cols]
+
+        if numeric_cols:
+            scaler = StandardScaler()
+            df_normalized = df.copy()
+            df_normalized[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+            df_normalized.to_csv(ml_csv, index=False)
+
+            print(f"\n[INFO] Wrote raw features for {len(rows)} entries to {output_csv}")
+            print(f"[INFO] Wrote ML-ready normalized features to {ml_csv}")
+        else:
+            df.to_csv(output_csv, index=False)
+            print(f"\n[INFO] Wrote metadata for {len(rows)} entries to {output_csv}")
+    else:
+        # Standard CSV output
+        with open(output_csv, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"\n[INFO] Wrote metadata for {len(rows)} entries to {output_csv}")
 
 if __name__ == "__main__":
     main()

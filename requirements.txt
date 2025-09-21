@@ -4,3 +4,9 @@ scipy==1.13.1
 soundfile==0.12.1
 audioread==3.0.1
 numba==0.59.1
+pandas>=2.0.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+jupyter>=1.0.0
+ipykernel>=6.0.0
