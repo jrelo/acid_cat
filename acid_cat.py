@@ -2,7 +2,7 @@
 """
 acid_cat.py
 
-Full WAV metadata explorer with robust EOF scanning.
+Full WAV metadata explorer with librosa analysis fallback.
 
 Modes:
 - Default (summary): ACID/SMPL summary + expected duration + "Other chunks" list
@@ -10,7 +10,8 @@ Modes:
 - --survey: Count chunk IDs across scanned files and output a summary CSV
 - --kinds: List chunk IDs per file (quick "what metadata is here?" mode)
 - --has: Filter to files that include any of the given chunk IDs (comma-separated)
-- -v/--verbose: In --all mode, also print parsed rows to console (ignored if -q)
+- --fallback: Estimate BPM/key with librosa if no ACID/SMPL metadata is found
+- -v/--verbose: In --all mode, also print parsed rows to the console (ignored if -q)
 
 Examples:
   python acid_cat.py "D:\\Audio\\Loops" -n 200
@@ -19,6 +20,7 @@ Examples:
   python acid_cat.py "D:\\Audio\\Loops" --kinds -n 200
   python acid_cat.py "D:\\Audio\\Loops" --kinds --has acid
   python acid_cat.py "D:\\Audio\\Loops" --all --has acid,smpl -v
+  python acid_cat.py "D:\\Audio\\Loops" --fallback -n 100
 """
 
 import argparse
